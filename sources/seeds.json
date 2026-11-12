@@ -1,5 +1,5 @@
 {
-  "_说明": "每个数组是一个 seed，内部是镜像地址，按顺序尝试；来自原版 LiveEngine.SEEDS（15 组）。可自行增删。",
+  "_说明": "每个数组是一个 seed，内部是镜像地址，按顺序尝试；来自原版 LiveEngine.SEEDS（15 组）。可自行增删。后半段为本轮新增：专门补「只有 1 个源」的频道（央视 7/10/11、三沙卫视、港澳台、体育/少儿）。",
   "seeds": [
     ["https://gh-proxy.com/raw.githubusercontent.com/gaotianliuyun/gao/master/list.txt", "https://raw.githubusercontent.com/gaotianliuyun/gao/master/list.txt"],
     ["https://gh-proxy.com/raw.githubusercontent.com/suxuang/myIPTV/main/ipv4.m3u", "https://raw.githubusercontent.com/suxuang/myIPTV/main/ipv4.m3u"],
@@ -15,6 +15,14 @@
     ["https://iptv-org.github.io/iptv/countries/cn.m3u"],
     ["https://iptv-org.github.io/iptv/countries/hk.m3u"],
     ["https://iptv-org.github.io/iptv/countries/tw.m3u"],
-    ["https://iptv-org.github.io/iptv/countries/mo.m3u"]
+    ["https://iptv-org.github.io/iptv/countries/mo.m3u"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/kimwang1978/collect-txt/main/assets/blacklist1/whitelist_auto_tv.txt", "https://raw.githubusercontent.com/kimwang1978/collect-txt/main/assets/blacklist1/whitelist_auto_tv.txt"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/best-fan/iptv-sources/main/cn_all.m3u8", "https://raw.githubusercontent.com/best-fan/iptv-sources/main/cn_all.m3u8"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/xisohi/CHINA-IPTV/main/TV/live.txt", "https://raw.githubusercontent.com/xisohi/CHINA-IPTV/main/TV/live.txt"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV1_ALL.m3u8", "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/cnTV1_ALL.m3u8"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/hujingguang/ChinaIPTV/main/otherCountry.m3u8", "https://raw.githubusercontent.com/hujingguang/ChinaIPTV/main/otherCountry.m3u8"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/fanmingming/live/main/tv/m3u/itv.m3u", "https://raw.githubusercontent.com/fanmingming/live/main/tv/m3u/itv.m3u"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/akiralereal/iptv/main/from-the-web/from-the-web.m3u", "https://raw.githubusercontent.com/akiralereal/iptv/main/from-the-web/from-the-web.m3u"],
+    ["https://gh-proxy.com/raw.githubusercontent.com/qwerttvv/Beijing-IPTV/master/IPTV-Unicom.m3u", "https://raw.githubusercontent.com/qwerttvv/Beijing-IPTV/master/IPTV-Unicom.m3u"]
   ]
 }
