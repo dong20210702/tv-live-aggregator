@@ -667,10 +667,17 @@ def _probe(e, allow_private):
 
 
 def score(e):
-    """原版 LiveEngine.score：25 + 40*速度 + 35*(0.6*码率项 + 0.4*分辨率项)，四舍五入。"""
+    """原版 LiveEngine.score：25 + 40*速度 + 35*(0.6*码率项 + 0.4*分辨率项)，四舍五入。
+
+    速度项用**分片首包**（seg_ttfb_ms），而不是播放列表 TTFB。原版只有播放列表
+    可测，所以用 ttfb_ms；现在已经有分片级数据了，还拿列表响应时间当速度，
+    会把「列表秒回、分片却要 2 秒」的源评成高分——这正是 CCTV-13 首选源
+    2091ms 却排第一的原因。列表 TTFB 只在没有分片数据时兜底。
+    """
     if not e.ok:
         return 0
-    speed = 1.0 - min(max(e.ttfb_ms, 0), 3000) / 3000.0
+    speed_ms = e.seg_ttfb_ms or e.ttfb_ms
+    speed = 1.0 - min(max(speed_ms, 0), 3000) / 3000.0
     bitrate_term = min(e.bitrate / 12000.0, 1.0) if e.bitrate > 0 else 0.0
     h = e.res_h if e.res_h > 0 else height_of(e.quality)
     res_term = min(h / 1920.0, 1.0) if h > 0 else 0.0
