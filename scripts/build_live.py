@@ -9,9 +9,11 @@
   2. 并发抓取所有 seed -> 解析 M3U / TXT -> 按 URL 去重（最多 MAX_ENTRIES 条）
   3. 并发探测每条：
        播放列表 GET（超时 2s，记录 TTFB）
-       -> 若是媒体播放列表：取第一个分片，用 Range: bytes=0-1023 探测（超时 1.5~4s）
-       -> 若是主播放列表（含 #EXT-X-STREAM-INF）：取 BANDWIDTH 最大的变体，得到码率与分辨率
-  4. 计算 score，按频道归类到 8 个分组，每个频道保留前 N 条
+       -> 若是主播放列表（含 #EXT-X-STREAM-INF）：取**中位档**变体，得到码率与分辨率
+       -> 取第一个分片，用 Range 拉一小段（默认 256KB）测 TTFB 与**吞吐**，
+          吞吐显著低于码率时标 bw_ok=False（仍保留，只降序，不直接判死）
+  4. 计算 score，按频道归类到 8 个分组；排序以**延时优先**，
+     并保证候选多样性（至少留一条低码率快源）
   5. 输出 output/live.m3u、output/live.txt、output/live.json
 
 用法：
@@ -28,10 +30,12 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
@@ -43,11 +47,27 @@ LIST_ATTEMPTS = 2            # 每个镜像最多尝试 2 次
 LIST_MAX_BYTES = 8 * 1024 * 1024
 PLAYLIST_TIMEOUT = 2.0       # 探测播放列表（原版 fetch(url, 2000)）
 PLAYLIST_MAX_BYTES = 2 * 1024 * 1024
-SEGMENT_TIMEOUT = 3.0        # 探测分片（原版 probeSegment(url, 3000)），钳制到 [1.5, 4.0]
-SEGMENT_MIN, SEGMENT_MAX = 1.5, 4.0
-SEGMENT_RANGE = "bytes=0-1023"
+SEGMENT_TIMEOUT = 4.0        # 分片探测（要读一小段算吞吐），钳制到 [2.0, 5.0]
+SEGMENT_MIN, SEGMENT_MAX = 2.0, 5.0
+# 只读 1KB 能证明「分片存在」，证明不了「带宽撑得住码率」——这是首包很快、播放却卡的
+# 根因。改成拉一小段并算吞吐，顺带把 throughput_kbps 输出给客户端做选路参考。
+THROUGHPUT_SAMPLE = 128 * 1024      # 采样量上限
+THROUGHPUT_WINDOW = 1.5             # 采样时间窗（秒）：到点就停，避免慢源拖垮总预算
+THROUGHPUT_MIN_BYTES = 24 * 1024    # 低于此视为没测出来（记 0，不参与判定）
+# 吞吐探测会真占下行带宽，并发太高会互相抢带宽、把好源误判成「带宽不足」
+THROUGHPUT_CONCURRENCY = 48
+# 带宽判定的余量：吞吐要到码率的 1.15 倍才算「撑得住」
+BANDWIDTH_RATIO = 1.15
+# 探测端中位吞吐高于此值就认为「探测机带宽不是瓶颈」，可用绝对判定
+PROBER_OK_KBPS = 8000
+# 码率未知时（媒体播放列表没有 BANDWIDTH），按清晰度估一个期望码率参与判定
+QUALITY_KBPS = {"4K": 8000, "1080P": 4500, "720P": 2500, "480P": 1200, "高清": 2000}
+# 多样性门槛：低于此码率的源视为「低带宽友好」，每频道至少留一条
+CHEAP_BITRATE = 2500
 UA = "okhttp/4.12.0"          # 原版探测使用的 UA
-MAX_ENTRIES = 10000          # 原版上限
+# 原版上限 10000，但那是手机端一屏展示的量级。放到服务端后实测 10000 条探测仅耗
+# 135s（预算 900s），而种子总量已到 1.8 万条，旧上限会把后半批种子整组挤掉。
+MAX_ENTRIES = 30000
 MAX_PER_CHANNEL = 5          # UI 中单频道最多显示 5 条
 
 DEFAULT_PROBE_WORKERS = 128
@@ -89,6 +109,8 @@ RES_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 
 # TLS 使用 urllib 默认上下文（GitHub Runner / 系统 CA 即可）
 _SSL_CTX = None
+# 吞吐探测会占真实下行带宽，并发太高会互相抢带宽、把好源误判成「带宽不足」
+_BW_SEM = threading.Semaphore(THROUGHPUT_CONCURRENCY)
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +128,12 @@ class Entry:
     note: str = ""
     ttfb_ms: int = 0
     first_seg: str = ""
+    seg_ttfb_ms: int = 0     # 分片首包，比播放列表 TTFB 更接近「点开多久出画面」
+    throughput: int = 0      # kbps，实测下行吞吐（0 = 未测出）
+    bw_ok: bool = True       # 吞吐是否撑得住码率（未知时视为 True，不惩罚）
     res_h: int = 0           # 来自主播放列表的 RESOLUTION 高度
-    bitrate: int = 0         # kbps，来自 BANDWIDTH/1000
+    bitrate: int = 0         # kbps，中位档 BANDWIDTH/1000
+    peak_bitrate: int = 0    # kbps，最高档 BANDWIDTH/1000（给客户端做自适应参考）
     quality: str = ""
     score: int = 0
 
@@ -121,6 +147,8 @@ class Resp:
     binary: bool = False
     text: str | None = None
     body: bytes = b""
+    bytes_read: int = 0
+    throughput: int = 0
     error: str = ""
     dead: bool = False       # 仅分片探测使用：分片不可用
 
@@ -205,20 +233,106 @@ def http_get(url, timeout, read_limit, allow_private, headers=None):
     return r
 
 
+def _throughput_kbps(got, head_len, t_first, t_last, t_start):
+    """由「已读字节 / 耗时」估下行吞吐（kbps）。
+
+    优先用首包之后的部分算（更能反映带宽而非 RTT）；样本不足时退回含首包的
+    保守估计；都不够就返回 0 表示「没测出来」，避免拿噪声去判死源。
+    """
+    body, dt = got - head_len, t_last - t_first
+    if body >= THROUGHPUT_MIN_BYTES and dt >= 0.03:
+        return int(body * 8 / dt / 1000)
+    if got >= THROUGHPUT_MIN_BYTES // 2:
+        return int(got * 8 / max(t_last - t_start, 1e-3) / 1000)
+    return 0
+
+
+def _seg_fetch(req, t, r):
+    """在信号量内做真实网络读取，返回计时与字节数。失败时置 r.dead。"""
+    t_start = t_first = t_last = time.monotonic()
+    got = head_len = 0
+    try:
+        resp = urllib.request.urlopen(req, timeout=t, context=_SSL_CTX)
+    except urllib.error.HTTPError as e:
+        r.status, r.dead, r.error = e.code, True, f"分片 HTTP {e.code}"
+        return t_start, t_first, t_last, got, head_len
+    except (TimeoutError, socket.timeout):
+        r.dead, r.error = True, "分片超时"
+        return t_start, t_first, t_last, got, head_len
+    except (urllib.error.URLError, OSError, ValueError):
+        r.dead, r.error = True, "分片不可达"
+        return t_start, t_first, t_last, got, head_len
+    try:
+        with resp:
+            r.status = resp.status
+            r.ctype = (resp.headers.get("Content-Type") or "").lower()
+            if r.status >= 400:
+                r.dead, r.error = True, f"分片 HTTP {r.status}"
+                return t_start, t_first, t_last, got, head_len
+            head = resp.read(1024)
+            t_first = time.monotonic()
+            r.ttfb_ms = int((t_first - t_start) * 1000)
+            head_len = got = len(head)
+            r.body = head
+            if not head:
+                r.dead, r.error = True, "分片读取失败"
+                return t_start, t_first, t_last, got, head_len
+            try:
+                while got < THROUGHPUT_SAMPLE:
+                    if time.monotonic() - t_first > THROUGHPUT_WINDOW:
+                        break
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+            except (TimeoutError, socket.timeout):
+                pass          # 读不完不影响判定，按已读部分估吞吐
+            t_last = time.monotonic()
+    except (TimeoutError, socket.timeout):
+        t_last = time.monotonic()
+    except (urllib.error.URLError, OSError, ValueError):
+        t_last = time.monotonic()
+    return t_start, t_first, t_last, got, head_len
+
+
 def probe_segment(url, timeout, allow_private):
-    """原版 Http.probeSegment：Range 探测首个分片，返回 Resp.dead 表示不可用。"""
+    """探测首个分片：既确认可用，也测一小段吞吐。
+
+    旧实现只 Range 读 1KB，只能证明「分片存在」，证明不了「带宽撑得住码率」——
+    这正是首包几十毫秒、一放就卡的那类源。
+
+    采样限定在 THROUGHPUT_WINDOW 时间窗内：到点就停，慢源不会把总预算拖爆；
+    读不完也不丢，按已收到的部分估，只有真的一字节都读不到才判死。
+    计时在拿到信号量之后才起，否则排队时间会被算进首包。
+    """
     t = min(max(timeout, SEGMENT_MIN), SEGMENT_MAX)
-    r = http_get(url, t, 1024, allow_private, headers={"Range": SEGMENT_RANGE})
-    if r.status >= 400:
-        r.dead, r.error = True, f"分片 HTTP {r.status}"
-    elif not r.ok:
-        r.dead, r.error = True, r.error or "分片读取失败"
-    elif "html" in r.ctype:
+    r = Resp()
+    if not host_allowed(url, allow_private):
+        r.dead, r.error = True, "地址不允许"
+        return r
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept-Encoding": "identity",
+        "Range": f"bytes=0-{THROUGHPUT_SAMPLE - 1}",
+    })
+    with _BW_SEM:
+        t_start, t_first, t_last, got, head_len = _seg_fetch(req, t, r)
+    if r.dead:
+        return r
+
+    r.bytes_read = got
+    r.ok = True
+    if r.body[:7] == b"#EXTM3U":
+        # 二级播放列表被当成「分片」拉下来了：能访问就算这条源活着，
+        # 但别用一个播放列表的长度去折算吞吐。
+        r.throughput = 0
+        r.error = "分片是二级播放列表"
+        return r
+    r.throughput = _throughput_kbps(got, head_len, t_first, t_last, t_start)
+    if "html" in r.ctype:
         r.dead, r.error = True, "分片返回网页"
     elif r.body[:1] in (b"<", b"{"):
         r.dead, r.error = True, "分片返回网页"
-    elif not r.body:
-        r.dead, r.error = True, "分片读取失败"
     return r
 
 
@@ -243,6 +357,9 @@ def clean_name(s):
     s = (s or "").replace("\ufeff", "").replace("\u00a0", " ").strip()
     if '="' in s:
         s = re.sub(r'[A-Za-z0-9_-]+\s*=\s*"[^"]*"', "", s).strip()
+    # 头部也要清：上游常见「,,宁夏卫视」这种双逗号写法，只清尾部会让同一个频道
+    # 变成「宁夏卫视」和「,宁夏卫视」两个不同的 bucket。
+    s = re.sub(r"^[,;:、，；：。\s]+", "", s).strip()
     s = re.sub(r"[,;\s]+$", "", s).strip()
     return s
 
@@ -318,6 +435,7 @@ def base_name(name):
     for w in ("高清", "超清", "蓝光", "标清"):
         s = s.replace(w, "")
     s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"^[-_·|/\\,;:、，；：。]+", "", s).strip()
     s = re.sub(r"[-_·|/\\]+$", "", s).strip()
     if s.upper().startswith("CCTV"):
         rest = re.sub(r"^[-_ ]+", "", s[4:].strip())
@@ -404,9 +522,18 @@ def first_segment_url(base, text):
 
 
 def best_variant(text):
-    """主播放列表中 BANDWIDTH 最大的变体 -> (kbps, 高度)。"""
-    best_bw, best_h, found = 0, 0, False
-    for raw in text.split("\n"):
+    """主播放列表 -> (中位档 kbps, 中位档 URI, 最高档 kbps, 最高档高度)。
+
+    旧实现取 BANDWIDTH **最大**的变体，而码率在 score 里是加分项——等于系统性
+    把最重的那条流顶到最前面，国内窄带上就是卡顿的直接来源。
+
+    现在两个用途分开取：
+      - **探测/判定**用中位档（可持续的那个），顺便下钻它才能验证真能不能播；
+      - **清晰度标注**用最高档（频道真实上限），否则 4K 频道会被标成 480P。
+    """
+    lines = text.split("\n")
+    variants = []
+    for i, raw in enumerate(lines):
         line = raw.strip()
         if not line.startswith("#EXT-X-STREAM-INF"):
             continue
@@ -414,11 +541,23 @@ def best_variant(text):
         bw = int(m_bw.group(1)) if m_bw else 0
         m_res = RES_RE.search(line)
         h = int(m_res.group(2)) if m_res else 0
-        if not found or bw > best_bw:
-            best_bw, best_h, found = bw, h, True
-    if not found:
+        uri = ""
+        for nxt in lines[i + 1:]:
+            nxt = nxt.strip()
+            if not nxt:
+                continue
+            if nxt.startswith("#"):
+                break
+            uri = nxt
+            break
+        variants.append((bw // 1000, h, uri))
+    if not variants:
         return None
-    return best_bw // 1000, best_h
+    usable = [v for v in variants if v[0] > 0] or variants
+    usable.sort(key=lambda v: v[0])
+    mid = usable[len(usable) // 2]
+    top = usable[-1]
+    return mid[0], mid[2], top[0], top[1]
 
 
 def height_of(quality):
@@ -469,6 +608,11 @@ def probe(e, allow_private):
         e.probed = True
 
 
+def expected_kbps(e):
+    """判定用的期望码率：优先用实测变体码率，其次按清晰度估一个。"""
+    return e.bitrate or QUALITY_KBPS.get(e.quality, 0)
+
+
 def _probe(e, allow_private):
     e.quality = quality_of(e)
     if not e.url.lower().startswith(("http://", "https://")):
@@ -484,22 +628,41 @@ def _probe(e, allow_private):
         e.note = "不是直播流"
         return
     e.ok = True
-    e.first_seg = first_segment_url(e.url, text) or ""
     is_master = "#EXT-X-STREAM-INF" in text
+    variant_uri = ""
+    # 变体要在分片探测之前解析：带宽判定需要先有码率
+    if is_master:
+        v = best_variant(text)
+        if v:
+            mid_kbps, mid_uri, top_kbps, top_h = v
+            e.bitrate = mid_kbps          # 判定 / 打分用可持续档
+            e.peak_bitrate = top_kbps
+            e.res_h = top_h               # 清晰度标注用真实上限
+            variant_uri = mid_uri
+            e.quality = quality_of(e)
+    e.first_seg = first_segment_url(e.url, text) or ""
+    if not e.first_seg and is_master:
+        # 主播放列表本身没有分片（旧实现到这一步就直接判「可用」了，是假通过）。
+        # 下钻一层到中位变体的媒体播放列表，再取它的首个分片。
+        if variant_uri:
+            vurl = urllib.parse.urljoin(e.url, variant_uri)
+            r2 = http_get(vurl, PLAYLIST_TIMEOUT, PLAYLIST_MAX_BYTES, allow_private)
+            if r2.ok and not r2.binary and r2.text:
+                e.first_seg = first_segment_url(vurl, r2.text) or ""
     if not e.first_seg and not is_master:
         e.ok = False
         e.note = "播放列表无分片"
         return
-    if e.first_seg:
-        s = probe_segment(e.first_seg, SEGMENT_TIMEOUT, allow_private)
-        if s.dead:
-            e.ok = False
-            e.note = s.error or "分片不可用"
-            return
-    if is_master:
-        v = best_variant(text)
-        if v:
-            e.bitrate, e.res_h = v
+    if not e.first_seg:
+        e.note = "主列表未取到分片"      # 保留，但标明未做分片级验证
+        return
+    s = probe_segment(e.first_seg, SEGMENT_TIMEOUT, allow_private)
+    if s.dead:
+        e.ok = False
+        e.note = s.error or "分片不可用"
+        return
+    e.seg_ttfb_ms = s.ttfb_ms
+    e.throughput = s.throughput
     e.quality = quality_of(e)
 
 
@@ -534,22 +697,153 @@ def fetch_seed(urls, allow_private, log):
     return []
 
 
+# 这些名字各地都有，同名未必同台，仍需靠分组区分，避免把不同城市的源并到一起
+GENERIC_NAMES = {
+    "新闻综合", "综合", "公共", "公共频道", "影视", "电影", "体育", "少儿",
+    "都市", "生活", "新闻", "综合频道", "经济", "科教", "文旅", "纪实",
+}
+
+
+def channel_key(cat, display):
+    """频道主键。
+
+    旧实现用 (分组, 名称) 做 key，而分组是由各源自己的 group-title 推出来的，
+    于是「上虞新闻综合」在 A 列表落「地方频道」、在 B 列表落「其他」，被劈成两个
+    频道、各带 1 条源。改为默认只认名称，分组在聚合时按多数票决定。
+    """
+    if display in GENERIC_NAMES or len(display) <= 3:
+        return (cat, display)
+    return ("", display)
+
+
+def allocate_entries(results, max_entries):
+    """按 seed 公平分配探测名额，返回 (entries, 去重总数, 丢弃数)。
+
+    旧实现按 seed 顺序先到先得，一碰到上限就整组 break。实测 6 号种子
+    (CCSH/IPTV) 一家贡献 6964 条，累计到 7 号就卡满 10000，后面的 8~15 号种子
+    共 8011 条（44%）从未进入探测——不是没源，是没测。
+
+    现在：先给每个 seed 一个保底名额，剩余名额在所有 seed 之间轮转回填，
+    单个大列表再也不可能把其他列表挤死。
+    """
+    seen, queues = set(), []
+    for lst in results:
+        q = []
+        for e in lst:
+            if e.url in seen:
+                continue
+            seen.add(e.url)
+            q.append(e)
+        queues.append(q)
+
+    total = sum(len(q) for q in queues)
+    if total <= max_entries:
+        return [e for q in queues for e in q], total, 0
+
+    n = len(queues)
+    floor = max(1, max_entries // (n * 4))      # 每组的保底份额
+    entries, leftover = [], []
+    for q in queues:
+        entries.extend(q[:floor])
+        leftover.append(q[floor:])
+
+    ptr = [0] * n
+    while len(entries) < max_entries:
+        progressed = False
+        for i in range(n):
+            if ptr[i] < len(leftover[i]):
+                entries.append(leftover[i][ptr[i]])
+                ptr[i] += 1
+                progressed = True
+                if len(entries) >= max_entries:
+                    break
+        if not progressed:
+            break
+    return entries, total, total - len(entries)
+
+
+def apply_bandwidth_judgement(entries):
+    """按实测吞吐给源打 bw_ok 标记，返回被降序的条数。
+
+    难点在于「测出来的慢」可能是源站慢，也可能是探测机自己的带宽不够（家用宽带
+    常见只有 1~10Mbps，128 并发时更是互相抢带宽）。所以先看探测端本身够不够快：
+
+      - 探测端中位吞吐 >= PROBER_OK_KBPS：绝对判定可信，吞吐低于码率×1.15 就算不足；
+      - 否则：只抓明显比别人慢的（低于中位数的 1/3），避免整轮结果被探测端拖累。
+
+    无论哪种，bw_ok=False 只是降序、不判死——「能播但会卡」总比「频道直接消失」好。
+    """
+    vals = sorted(e.throughput for e in entries if e.ok and e.throughput > 0)
+    if len(vals) < 30:
+        return 0
+    med = vals[len(vals) // 2]
+    prober_fast = med >= PROBER_OK_KBPS
+    slow_line = max(300, med // 3)
+    n = 0
+    for e in entries:
+        if not e.ok or not e.throughput:
+            continue
+        want = expected_kbps(e)
+        if not want or e.throughput >= want * BANDWIDTH_RATIO:
+            continue
+        if prober_fast or e.throughput < slow_line:
+            e.bw_ok = False
+            e.note = f"带宽不足 {e.throughput}kbps < 码率 {want}kbps"
+            n += 1
+    return n
+
+
+def rank_key(s):
+    """排序：带宽达标优先 -> 综合评分高 -> 分片延时低。
+
+    试过纯延时优先，结果是把结果全推成 480P（首条源 480P 从 318 涨到 1235，
+    720P/1080P 都在掉）——卡顿治了，清晰度塌了，用户不会满意。
+    改用 score：它本身就是「延时 40 + 码率/分辨率 35」的原版加权公式，两头都照顾；
+    而「挑到带不动的源」这个问题已经由 bw_ok 在源头解决了，不需要靠排序兜。
+    """
+    return (0 if s.bw_ok else 1,
+            -s.score,
+            s.seg_ttfb_ms or s.ttfb_ms or 99999)
+
+
+def pick_sources(srcs, limit):
+    """排序取前 N 条，并保证候选多样性。"""
+    srcs.sort(key=rank_key)
+    if len(srcs) <= limit:
+        return srcs
+    picked = srcs[:limit]
+    # 若入选的全是高码率源，换掉最后一条，保证至少留一条低码率快源：
+    # 弱网下它往往是唯一能播的那条，也是客户端选路的兜底
+    has_cheap = any(s.bitrate and s.bitrate <= CHEAP_BITRATE for s in picked)
+    if not has_cheap:
+        cheap = [s for s in srcs if s.bitrate and s.bitrate <= CHEAP_BITRATE]
+        if cheap:
+            picked = picked[:-1] + [cheap[0]]
+    return picked
+
+
 def build_channels(entries, per_channel):
-    buckets = {}
+    buckets, names = {}, {}
     for e in entries:
         if not e.ok:
             continue
         e.category = classify(e.name, e.group)
         bn = base_name(e.name)
         display = canonical_cctv(bn) or bn      # 「CCTV-1 综合」统一显示为 CCTV-1
-        if display in STD_CCTV:
-            display = canonical_cctv(bn)
-        key = (e.category, display)
+        key = channel_key(e.category, display)
+        names[key] = display
         buckets.setdefault(key, []).append(e)
     channels = []
-    for (cat, name), srcs in buckets.items():
-        srcs.sort(key=lambda x: (-QUALITY_RANK.get(x.quality, 0), -x.score, x.ttfb_ms))
-        channels.append({"group": cat, "name": name, "sources": srcs[:per_channel]})
+    for key, srcs in buckets.items():
+        # 分组取多数票，但「其他」是兜底桶、不算有效表态：否则一个大列表里没写
+        # group-title 的源会把「XXX体育」从体育频道投进「其他」。
+        cnt = Counter(x.category for x in srcs if x.category != "其他")
+        if not cnt:
+            cnt = Counter({"其他": 1})
+        cat = min(cnt, key=lambda c: (-cnt[c], GROUPS.index(c) if c in GROUPS else 99))
+        name = names[key]
+        channels.append({"group": cat, "name": name,
+                         "sources": pick_sources(srcs, per_channel)})
     gidx = {g: i for i, g in enumerate(GROUPS)}
     channels.sort(key=lambda c: (gidx.get(c["group"], 99), natural_key(c["name"])))
     return channels
@@ -565,8 +859,11 @@ def write_outputs(channels, meta, out_dir):
         groups_json.setdefault(g, []).append({
             "name": ch["name"],
             "sources": [{
-                "url": s.url, "quality": s.quality, "ttfb_ms": s.ttfb_ms,
-                "bitrate_kbps": s.bitrate, "height": s.res_h, "score": s.score,
+                "url": s.url, "quality": s.quality,
+                "ttfb_ms": s.ttfb_ms, "seg_ttfb_ms": s.seg_ttfb_ms,
+                "throughput_kbps": s.throughput, "bandwidth_ok": s.bw_ok,
+                "bitrate_kbps": s.bitrate, "peak_bitrate_kbps": s.peak_bitrate,
+                "height": s.res_h, "score": s.score,
             } for s in ch["sources"]],
         })
         for s in ch["sources"]:
@@ -615,18 +912,9 @@ def main():
         results = list(ex.map(lambda s: fetch_seed(s, args.allow_private, log), seeds))
     lists_ok = sum(1 for r in results if r)
 
-    entries, seen = [], set()
-    for lst in results:
-        for e in lst:
-            if e.url in seen:
-                continue
-            seen.add(e.url)
-            entries.append(e)
-            if len(entries) >= args.max_entries:
-                break
-        if len(entries) >= args.max_entries:
-            break
-    log(f"== 去重后 {len(entries)} 条，列表成功 {lists_ok}/{len(seeds)}")
+    entries, entries_total, dropped = allocate_entries(results, args.max_entries)
+    log(f"== 去重后 {entries_total} 条，取 {len(entries)} 条探测，"
+        f"丢弃 {dropped} 条，列表成功 {lists_ok}/{len(seeds)}")
     if not entries:
         log("!! 没有抓到任何条目，保留旧输出，退出")
         sys.exit(1)
@@ -643,8 +931,10 @@ def main():
 
     for e in entries:
         e.score = score(e)
+    demoted = apply_bandwidth_judgement(entries)
     ok_entries = [e for e in entries if e.ok]
-    log(f"== 可用 {len(ok_entries)} / 已探测 {sum(1 for e in entries if e.probed)}")
+    log(f"== 可用 {len(ok_entries)} / 已探测 {sum(1 for e in entries if e.probed)}"
+        f"，带宽不足降序 {demoted}")
 
     if len(ok_entries) < args.min_ok:
         log("!! 可用条目过少，保留旧输出，退出")
@@ -657,7 +947,9 @@ def main():
         "seeds_total": len(seeds),
         "seeds_ok": lists_ok,
         "entries_raw": sum(len(r) for r in results),
-        "entries_unique": len(entries),
+        "entries_unique": entries_total,
+        "entries_probed": len(entries),
+        "entries_dropped": dropped,
         "entries_ok": len(ok_entries),
         "channels": len(channels),
         "per_channel_limit": args.per_channel,
