@@ -957,14 +957,20 @@ def apply_bandwidth_judgement(entries, prober_kbps=0):
 def rank_key(s):
     """排序：带宽达标优先 -> 综合评分高 -> 分片延时低。
 
-    试过纯延时优先，结果是把结果全推成 480P（首条源 480P 从 318 涨到 1235，
-    720P/1080P 都在掉）——卡顿治了，清晰度塌了，用户不会满意。
-    改用 score：它本身就是「延时 40 + 码率/分辨率 35」的原版加权公式，两头都照顾；
-    而「挑到带不动的源」这个问题已经由 bw_ok 在源头解决了，不需要靠排序兜。
+    分两段排，因为「都达标」和「都不达标」要的答案正好相反：
+
+      - 达标段：用 score（延时 40 + 码率/分辨率 35 的原版加权），两头都照顾。
+        试过纯延时优先，结果是把结果全推成 480P（480P 首条源 318 -> 1235），
+        卡顿治了、清晰度塌了，不可取。
+      - 不达标段：改用「实测吞吐 / 该源自己的码率」比值降序。一个频道所有源都
+        带不动时，按 score 排会继续把高码率那条顶到最前面——那恰恰是最容易卡死的。
+        这时该选「相对最接近自己码率」的那条，才真有希望播出来。
     """
-    return (0 if s.bw_ok else 1,
-            -s.score,
-            s.seg_ttfb_ms or s.ttfb_ms or 99999)
+    if s.bw_ok:
+        return (0, -s.score, s.seg_ttfb_ms or s.ttfb_ms or 99999)
+    want = expected_kbps(s)
+    ratio = (s.throughput / want) if (want and s.throughput) else 0.0
+    return (1, -ratio, s.seg_ttfb_ms or s.ttfb_ms or 99999)
 
 
 def pick_sources(srcs, limit):
