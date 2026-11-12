@@ -54,12 +54,25 @@ SEGMENT_MIN, SEGMENT_MAX = 2.0, 5.0
 THROUGHPUT_SAMPLE = 128 * 1024      # 采样量上限
 THROUGHPUT_WINDOW = 1.5             # 采样时间窗（秒）：到点就停，避免慢源拖垮总预算
 THROUGHPUT_MIN_BYTES = 24 * 1024    # 低于此视为没测出来（记 0，不参与判定）
-# 吞吐探测会真占下行带宽，并发太高会互相抢带宽、把好源误判成「带宽不足」
-THROUGHPUT_CONCURRENCY = 48
+# 吞吐探测会真占下行带宽，并发太高会互相抢带宽、把好源误判成「带宽不足」。
+# 48 并发实测只跑出 4121kbps 的中位吞吐（连 1080P 的 4500kbps 都不到），
+# 这显然是被自己抢占出来的，不是源站真实速度——降到 16 让采样更接近单流真实值。
+THROUGHPUT_CONCURRENCY = 16
 # 带宽判定的余量：吞吐要到码率的 1.15 倍才算「撑得住」
 BANDWIDTH_RATIO = 1.15
-# 探测端中位吞吐高于此值就认为「探测机带宽不是瓶颈」，可用绝对判定
+# 探测端单流吞吐高于此值就认为「探测机带宽不是瓶颈」，可用绝对判定
 PROBER_OK_KBPS = 8000
+# 探测端带宽标定：探测开始前用零并发的单流下载量一次，比从「源吞吐中位数」
+# 反推可靠得多——后者把「源站慢」和「探测机慢」混在一起，分不开。
+CALIBRATION_URLS = [
+    "https://speed.cloudflare.com/__down?bytes=1048576",
+    "https://cdn.jsdelivr.net/gh/dong20210702/tv-live-aggregator@main/output/live.m3u",
+]
+CALIBRATION_TIMEOUT = 8.0
+# 增量合并：一个频道至少要有这么多条可选源，不足时用上一轮的源补位
+MIN_SOURCES = 2
+# 增量合并：上一轮输出最多沿用到这么久之前，再旧就不要了（防止死链长期占位）
+MAX_CARRY_HOURS = 72
 # 码率未知时（媒体播放列表没有 BANDWIDTH），按清晰度估一个期望码率参与判定
 QUALITY_KBPS = {"4K": 8000, "1080P": 4500, "720P": 2500, "480P": 1200, "高清": 2000}
 # 多样性门槛：低于此码率的源视为「低带宽友好」，每频道至少留一条
@@ -136,6 +149,7 @@ class Entry:
     peak_bitrate: int = 0    # kbps，最高档 BANDWIDTH/1000（给客户端做自适应参考）
     quality: str = ""
     score: int = 0
+    stale: bool = False      # 来自上一轮输出的沿用源（本轮未通过探测，仅作兜底）
 
 
 @dataclass
@@ -149,6 +163,7 @@ class Resp:
     body: bytes = b""
     bytes_read: int = 0
     throughput: int = 0
+    elapsed: float = 0.0     # 整体耗时（秒），标定单流带宽时用
     error: str = ""
     dead: bool = False       # 仅分片探测使用：分片不可用
 
@@ -216,6 +231,7 @@ def http_get(url, timeout, read_limit, allow_private, headers=None):
                 r.error = f"HTTP {r.status}"
                 return r
             r.body = resp.read(read_limit)
+            r.bytes_read = len(r.body)
     except urllib.error.HTTPError as e:
         r.status = e.code
         r.error = f"HTTP {e.code}"
@@ -226,6 +242,8 @@ def http_get(url, timeout, read_limit, allow_private, headers=None):
     except (urllib.error.URLError, OSError, ValueError):
         r.error = "不可达"
         return r
+    finally:
+        r.elapsed = time.monotonic() - t0
     r.ok = True
     r.binary = is_binary(r.body)
     if not r.binary:
@@ -322,6 +340,7 @@ def probe_segment(url, timeout, allow_private):
 
     r.bytes_read = got
     r.ok = True
+    r.elapsed = max(t_last - t_start, 1e-3)   # 供带宽标定估算用
     if r.body[:7] == b"#EXTM3U":
         # 二级播放列表被当成「分片」拉下来了：能访问就算这条源活着，
         # 但别用一个播放列表的长度去折算吞吐。
@@ -601,6 +620,8 @@ def quality_of(e):
 def probe(e, allow_private):
     try:
         _probe(e, allow_private)
+        if e.ok:
+            e.stale = False      # 本轮实测通过的沿用源就是正常源了
     except Exception as ex:  # 单条失败不影响整体
         e.ok = False
         e.note = f"探测异常: {type(ex).__name__}"
@@ -769,14 +790,142 @@ def allocate_entries(results, max_entries):
     return entries, total, total - len(entries)
 
 
-def apply_bandwidth_judgement(entries):
+def calibrate_prober_kbps(allow_private, log):
+    """零并发单流下载，量一次探测端自己的吞吐（kbps），失败返回 0。
+
+    为什么不能沿用「取源吞吐中位数」来判断探测机够不够快：那个数把「源站慢」和
+    「探测机慢」混在一起。GHA 上 128 并发实测中位 4121kbps，看着像探测机只有
+    4Mbps，其实是并发自抢占。单独量一次才知道真实上限，绝对判定才有前提。
+    """
+    best = 0
+    for u in CALIBRATION_URLS:
+        # 复用分片探测的采样逻辑（时间窗 + 部分读取），而不是 http_get：
+        # http_get 是一次性 read(N)，慢链路上会整体超时、一个字节都读不回来，
+        # 标定就成了 0。这里只要能读到一小段就能估出上游带宽。
+        r = probe_segment(u, CALIBRATION_TIMEOUT, allow_private)
+        if r.status >= 400 or r.bytes_read < 24 * 1024:
+            log(f"   [标定] {urllib.parse.urlsplit(u).hostname}: 失败（"
+                f"{r.error or f'{r.bytes_read}B'}）")
+            continue
+        kbps = r.throughput or int(r.bytes_read * 8 / max(r.elapsed, 1e-3) / 1000)
+        log(f"   [标定] {urllib.parse.urlsplit(u).hostname}: {r.bytes_read}B "
+            f"/ {r.elapsed:.2f}s = {kbps}kbps")
+        best = max(best, kbps)
+    return best
+
+
+def load_previous(path, log):
+    """读上一轮输出，返回 ({频道名: {"group":.., "sources":[..]}}, meta)，失败返回 ({}, {})。"""
+    if not path or not os.path.exists(path):
+        log(f"== 增量合并：未找到上一轮输出（{path}），本轮为全量")
+        return {}, {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as ex:
+        log(f"!! 上一轮输出无法解析（{type(ex).__name__}），跳过增量合并")
+        return {}, {}
+    meta = d.get("meta") or {}
+    # 太旧的输出不要：上游改过地址后，旧链接只会长期占着位置
+    ts = meta.get("updated_at") or ""
+    try:
+        age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds() / 3600
+    except (TypeError, ValueError):
+        age_h = 0.0
+    if age_h > MAX_CARRY_HOURS:
+        log(f"== 增量合并：上一轮输出已 {age_h:.0f} 小时（>{MAX_CARRY_HOURS}h），跳过")
+        return {}, {}
+    prev = {}
+    for g in d.get("groups", []):
+        for c in g.get("channels", []):
+            rec = prev.setdefault(c.get("name", ""), {"group": g.get("group", ""), "sources": []})
+            for s in c.get("sources", []):
+                if s.get("url"):
+                    rec["sources"].append(s)
+    log(f"== 增量合并：上一轮 {len(prev)} 个频道、"
+        f"{sum(len(v['sources']) for v in prev.values())} 条源（{age_h:.1f}h 前）")
+    return prev, meta
+
+
+def carry_entries(prev, group_of, log):
+    """把上一轮的源还原成 Entry 参与本轮探测；通过探测的当正常源，没通过的留作兜底。"""
+    out = []
+    for name, rec in prev.items():
+        for s in rec["sources"]:
+            e = Entry(name=name, url=s["url"], group=rec.get("group", ""))
+            e.ttfb_ms = int(s.get("ttfb_ms") or 0)
+            e.seg_ttfb_ms = int(s.get("seg_ttfb_ms") or 0)
+            e.throughput = int(s.get("throughput_kbps") or 0)
+            e.bitrate = int(s.get("bitrate_kbps") or 0)
+            e.peak_bitrate = int(s.get("peak_bitrate_kbps") or 0)
+            e.res_h = int(s.get("height") or 0)
+            e.quality = s.get("quality") or ""
+            e.stale = True
+            e.ok = False         # 由本轮探测结果决定；探测超时时保持 False，不当可用源
+            out.append(e)
+    return out
+
+
+def fill_from_carry(channels, prev, per_channel, log):
+    """用上一轮没通过探测的源补位：频道整条缺失时重建，源不足时补齐。
+
+    这是「频道整条消失」的解药：上游抖一次、或某个源这轮探测超时，主流频道
+    就从 5 条源掉到 0 条。宁可给用户一条标了 stale 的旧链接，也好过频道直接没了。
+    """
+    by_name = {c["name"]: c for c in channels}
+    added_ch = added_src = 0
+    for name, rec in prev.items():
+        if not name:
+            continue
+        pool = []
+        for s in rec["sources"]:
+            e = Entry(name=name, url=s["url"], group=rec.get("group", ""))
+            e.ttfb_ms = int(s.get("ttfb_ms") or 0)
+            e.seg_ttfb_ms = int(s.get("seg_ttfb_ms") or 0)
+            e.throughput = int(s.get("throughput_kbps") or 0)
+            e.bitrate = int(s.get("bitrate_kbps") or 0)
+            e.peak_bitrate = int(s.get("peak_bitrate_kbps") or 0)
+            e.res_h = int(s.get("height") or 0)
+            e.quality = s.get("quality") or ""
+            e.ok = True
+            e.stale = True
+            e.score = score(e)
+            pool.append(e)
+        if not pool:
+            continue
+        pool.sort(key=lambda x: -x.score)
+        ch = by_name.get(name)
+        if ch is None:
+            # 频道整条没了：按上一轮的分组重建，源全部标 stale
+            ch = {"group": rec.get("group") or "其他", "name": name,
+                  "sources": pool[:MIN_SOURCES], "carried": True}
+            channels.append(ch)
+            by_name[name] = ch
+            added_ch += 1
+            added_src += len(ch["sources"])
+            continue
+        have = {s.url for s in ch["sources"]}
+        room = MIN_SOURCES - len(ch["sources"])
+        if room <= 0:
+            continue
+        extra = [e for e in pool if e.url not in have][:room]
+        if extra:
+            ch["sources"].extend(extra)
+            added_src += len(extra)
+    if added_ch or added_src:
+        log(f"== 增量合并：重建 {added_ch} 个频道，补入 {added_src} 条沿用源")
+    return added_ch, added_src
+
+
+def apply_bandwidth_judgement(entries, prober_kbps=0):
     """按实测吞吐给源打 bw_ok 标记，返回被降序的条数。
 
-    难点在于「测出来的慢」可能是源站慢，也可能是探测机自己的带宽不够（家用宽带
-    常见只有 1~10Mbps，128 并发时更是互相抢带宽）。所以先看探测端本身够不够快：
+    判定是否可信，取决于探测端自己够不够快。优先用启动时的单流标定值：
 
-      - 探测端中位吞吐 >= PROBER_OK_KBPS：绝对判定可信，吞吐低于码率×1.15 就算不足；
-      - 否则：只抓明显比别人慢的（低于中位数的 1/3），避免整轮结果被探测端拖累。
+      - 标定值 >= PROBER_OK_KBPS：探测机不是瓶颈，绝对判定可信，
+        吞吐低于码率×1.15 就算带宽不足；
+      - 标定值偏低或标定失败：退化为相对判定，只抓明显比同伴慢的（< 中位 1/3），
+        避免整轮结果被探测机拖累。
 
     无论哪种，bw_ok=False 只是降序、不判死——「能播但会卡」总比「频道直接消失」好。
     """
@@ -784,7 +933,12 @@ def apply_bandwidth_judgement(entries):
     if len(vals) < 30:
         return 0
     med = vals[len(vals) // 2]
-    prober_fast = med >= PROBER_OK_KBPS
+    if prober_kbps > 0:
+        prober_fast = prober_kbps >= PROBER_OK_KBPS
+        basis = f"标定 {prober_kbps}kbps"
+    else:
+        prober_fast = med >= PROBER_OK_KBPS
+        basis = f"中位推断 {med}kbps"
     slow_line = max(300, med // 3)
     n = 0
     for e in entries:
@@ -797,7 +951,7 @@ def apply_bandwidth_judgement(entries):
             e.bw_ok = False
             e.note = f"带宽不足 {e.throughput}kbps < 码率 {want}kbps"
             n += 1
-    return n
+    return n, prober_fast, basis
 
 
 def rank_key(s):
@@ -870,7 +1024,7 @@ def write_outputs(channels, meta, out_dir):
                 "ttfb_ms": s.ttfb_ms, "seg_ttfb_ms": s.seg_ttfb_ms,
                 "throughput_kbps": s.throughput, "bandwidth_ok": s.bw_ok,
                 "bitrate_kbps": s.bitrate, "peak_bitrate_kbps": s.peak_bitrate,
-                "height": s.res_h, "score": s.score,
+                "height": s.res_h, "score": s.score, "stale": s.stale,
             } for s in ch["sources"]],
         })
         for s in ch["sources"]:
@@ -905,7 +1059,13 @@ def main():
     ap.add_argument("--probe-budget", type=float, default=DEFAULT_PROBE_BUDGET)
     ap.add_argument("--min-ok", type=int, default=1, help="可用条目少于该数量时不覆盖输出并退出 1")
     ap.add_argument("--allow-private", action="store_true", help="允许内网地址（仅本地联调用）")
+    ap.add_argument("--previous", default="", help="上一轮输出路径，默认取 <out>/live.json；传 - 关闭增量合并")
+    ap.add_argument("--bw-concurrency", type=int, default=THROUGHPUT_CONCURRENCY,
+                    help=f"吞吐采样并发（默认 {THROUGHPUT_CONCURRENCY}）；调高会互相抢带宽，测不准")
     args = ap.parse_args()
+
+    global _BW_SEM
+    _BW_SEM = threading.Semaphore(max(1, args.bw_concurrency))
 
     def log(msg):
         print(msg, flush=True)
@@ -922,9 +1082,28 @@ def main():
     entries, entries_total, dropped = allocate_entries(results, args.max_entries)
     log(f"== 去重后 {entries_total} 条，取 {len(entries)} 条探测，"
         f"丢弃 {dropped} 条，列表成功 {lists_ok}/{len(seeds)}")
+
+    # 增量合并：把上一轮的源也拉回来重测。通过的当正常源（顺带拾回上游删掉的
+    # 漏网之鱼），没通过的留着兜底——否则上游抖一次，频道就从输出里整条消失。
+    prev_path = args.previous if args.previous else os.path.join(args.out, "live.json")
+    prev, prev_meta = ({}, {})
+    if args.previous != "-":
+        prev, prev_meta = load_previous(prev_path, log)
+    carry = carry_entries(prev, None, log) if prev else []
+    if carry:
+        known = {e.url for e in entries}
+        extra = [e for e in carry if e.url not in known]
+        if extra:
+            entries.extend(extra)
+            log(f"== 增量：上一轮有 {len(extra)} 条源不在本轮列表里，一并纳入探测")
+
     if not entries:
         log("!! 没有抓到任何条目，保留旧输出，退出")
         sys.exit(1)
+
+    prober_kbps = calibrate_prober_kbps(args.allow_private, log)
+    log(f"== 探测端单流标定 {prober_kbps}kbps"
+        f"（{'可做绝对带宽判定' if prober_kbps >= PROBER_OK_KBPS else '偏慢，仅做相对判定'}）")
 
     log("== 探测")
     ex = cf.ThreadPoolExecutor(max_workers=args.probe_workers)
@@ -938,16 +1117,21 @@ def main():
 
     for e in entries:
         e.score = score(e)
-    demoted = apply_bandwidth_judgement(entries)
+    demoted, absolute, basis = apply_bandwidth_judgement(entries, prober_kbps)
     ok_entries = [e for e in entries if e.ok]
     log(f"== 可用 {len(ok_entries)} / 已探测 {sum(1 for e in entries if e.probed)}"
-        f"，带宽不足降序 {demoted}")
+        f"，带宽不足降序 {demoted}（{basis}，{'绝对' if absolute else '相对'}判定）")
 
     if len(ok_entries) < args.min_ok:
         log("!! 可用条目过少，保留旧输出，退出")
         sys.exit(1)
 
     channels = build_channels(ok_entries, args.per_channel)
+    carried_ch = carried_src = 0
+    if prev:
+        carried_ch, carried_src = fill_from_carry(channels, prev, args.per_channel, log)
+        gidx = {g: i for i, g in enumerate(GROUPS)}
+        channels.sort(key=lambda c: (gidx.get(c["group"], 99), natural_key(c["name"])))
     meta = {
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "elapsed_sec": round(time.monotonic() - t_start, 1),
@@ -960,6 +1144,10 @@ def main():
         "entries_ok": len(ok_entries),
         "channels": len(channels),
         "per_channel_limit": args.per_channel,
+        "prober_kbps": prober_kbps,
+        "bandwidth_absolute": absolute,
+        "carried_channels": carried_ch,
+        "carried_sources": carried_src,
     }
     write_outputs(channels, meta, args.out)
     log(f"== 完成：{len(channels)} 个频道，写入 {args.out}/live.m3u|live.txt|live.json")
